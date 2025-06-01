@@ -1,4 +1,5 @@
 # 01_pg_candles_import_1m.py
+# Version= 3.01
 # Descarga velas OHLCV de 1 minuto para símbolos activos y las almacena en la tabla ohlcv_raw_1m.
 # Considera límites de la API REST de Bitget y arma el proceso en paquetes.
 # No usa multiproceso para evitar rate limits.
