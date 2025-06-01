@@ -1,7 +1,7 @@
 # 02_pg_ohlcv_agg_5m_15m_60m_240m_1440m.py
 # Consolida velas de 1 minuto (tabla ohlcv_raw_1m) en velas de 5, 15, 60, 240 y 1440 minutos.
 # Guarda resultados en tabla ohlcv, usando el campo cantidad_velas y timestamp_last.
-# yyyy, mm, dd, hh y timestamp_col se basan en la primera vela de cada bloque.
+# yyyy, mm, dd, hh y timestamp_col se CALCULAN DIRECTAMENTE desde el timestamp de la primera vela de cada bloque.
 
 import psycopg2
 from sqlalchemy import create_engine
@@ -11,7 +11,7 @@ import pytz
 
 # --- Parámetros de fechas de procesamiento ---
 YEAR_START_DT = datetime(2023, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
-YEAR_END_DT   = datetime(2023, 1, 11, 0, 0, 0, tzinfo=pytz.UTC)
+YEAR_END_DT   = datetime(2023, 6, 1, 0, 0, 0, tzinfo=pytz.UTC)
 
 # --- Parámetros de conexión (importados) ---
 from parmspg import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
@@ -70,6 +70,9 @@ def grabar_vela(df, engine):
     except Exception as err:
         print(f"Error al insertar velas en ohlcv: {err}")
 
+# --- Timezone Bogotá ---
+bogota_tz = pytz.timezone('America/Bogota')
+
 # --- Procesamiento principal ---
 try:
     cursor.execute("SELECT ticker FROM tickers WHERE activo = true")
@@ -108,11 +111,6 @@ try:
             close_15m = None
             volume_15m = 0.0
             timestamp_15m = None
-            timestamp_col_15m = None
-            yyyy_15m = None
-            mm_15m = None
-            dd_15m = None
-            hh_15m = None
 
             # 60m
             c_60m = 0
@@ -122,11 +120,6 @@ try:
             close_60m = None
             volume_60m = 0.0
             timestamp_60m = None
-            timestamp_col_60m = None
-            yyyy_60m = None
-            mm_60m = None
-            dd_60m = None
-            hh_60m = None
 
             # 240m
             c_240m = 0
@@ -136,11 +129,6 @@ try:
             close_240m = None
             volume_240m = 0.0
             timestamp_240m = None
-            timestamp_col_240m = None
-            yyyy_240m = None
-            mm_240m = None
-            dd_240m = None
-            hh_240m = None
 
             # 1440m
             c_1440m = 0
@@ -150,20 +138,10 @@ try:
             close_1440m = None
             volume_1440m = 0.0
             timestamp_1440m = None
-            timestamp_col_1440m = None
-            yyyy_1440m = None
-            mm_1440m = None
-            dd_1440m = None
-            hh_1440m = None
 
             # 5m (buffer)
             buffer_5m = []
             ts_first_5m = None
-            timestamp_col_5m = None
-            yyyy_5m = None
-            mm_5m = None
-            dd_5m = None
-            hh_5m = None
             c_5m = 0
 
             for i, row in enumerate(rows):
@@ -173,12 +151,7 @@ try:
                     'high': float(row[2]),
                     'low': float(row[3]),
                     'close': float(row[4]),
-                    'volume': float(row[5]),
-                    'timestamp_col': row[6],
-                    'yyyy': row[7],
-                    'mm': row[8],
-                    'dd': row[9],
-                    'hh': row[10]
+                    'volume': float(row[5])
                 }
 
                 # --- Actualizar variables para 15m ---
@@ -188,11 +161,6 @@ try:
                     low_15m = vela_1m['low']
                     volume_15m = vela_1m['volume']
                     timestamp_15m = vela_1m['timestamp']
-                    timestamp_col_15m = vela_1m['timestamp_col']
-                    yyyy_15m = vela_1m['yyyy']
-                    mm_15m = vela_1m['mm']
-                    dd_15m = vela_1m['dd']
-                    hh_15m = vela_1m['hh']
                 else:
                     if vela_1m['high'] > high_15m:
                         high_15m = vela_1m['high']
@@ -209,11 +177,6 @@ try:
                     low_60m = vela_1m['low']
                     volume_60m = vela_1m['volume']
                     timestamp_60m = vela_1m['timestamp']
-                    timestamp_col_60m = vela_1m['timestamp_col']
-                    yyyy_60m = vela_1m['yyyy']
-                    mm_60m = vela_1m['mm']
-                    dd_60m = vela_1m['dd']
-                    hh_60m = vela_1m['hh']
                 else:
                     if vela_1m['high'] > high_60m:
                         high_60m = vela_1m['high']
@@ -230,11 +193,6 @@ try:
                     low_240m = vela_1m['low']
                     volume_240m = vela_1m['volume']
                     timestamp_240m = vela_1m['timestamp']
-                    timestamp_col_240m = vela_1m['timestamp_col']
-                    yyyy_240m = vela_1m['yyyy']
-                    mm_240m = vela_1m['mm']
-                    dd_240m = vela_1m['dd']
-                    hh_240m = vela_1m['hh']
                 else:
                     if vela_1m['high'] > high_240m:
                         high_240m = vela_1m['high']
@@ -251,11 +209,6 @@ try:
                     low_1440m = vela_1m['low']
                     volume_1440m = vela_1m['volume']
                     timestamp_1440m = vela_1m['timestamp']
-                    timestamp_col_1440m = vela_1m['timestamp_col']
-                    yyyy_1440m = vela_1m['yyyy']
-                    mm_1440m = vela_1m['mm']
-                    dd_1440m = vela_1m['dd']
-                    hh_1440m = vela_1m['hh']
                 else:
                     if vela_1m['high'] > high_1440m:
                         high_1440m = vela_1m['high']
@@ -268,11 +221,6 @@ try:
                 # --- Procesamiento de 5m ---
                 if not buffer_5m:
                     ts_first_5m = vela_1m['timestamp']
-                    timestamp_col_5m = vela_1m['timestamp_col']
-                    yyyy_5m = vela_1m['yyyy']
-                    mm_5m = vela_1m['mm']
-                    dd_5m = vela_1m['dd']
-                    hh_5m = vela_1m['hh']
                 buffer_5m.append(vela_1m)
                 c_5m += 1
 
@@ -280,6 +228,11 @@ try:
                     ohlcv_5m = calc_ohlcv(buffer_5m)
                     cantidad_velas_5m = 5
                     timestamp_last_5m = ts_first_5m + timedelta(minutes=cantidad_velas_5m-1)
+                    yyyy_5m = ts_first_5m.year
+                    mm_5m = ts_first_5m.month
+                    dd_5m = ts_first_5m.day
+                    hh_5m = ts_first_5m.hour
+                    timestamp_col_5m = ts_first_5m.astimezone(bogota_tz)
                     vela_5m = {
                         'ticker': ticker,
                         'timeframe': 5,
@@ -308,17 +261,17 @@ try:
                         conn.rollback()
                     buffer_5m = []
                     ts_first_5m = None
-                    timestamp_col_5m = None
-                    yyyy_5m = None
-                    mm_5m = None
-                    dd_5m = None
-                    hh_5m = None
                     c_5m = 0
 
                     # --- Lógica de 15m: Vela parcial solo si c_15m < 15 ---
                     if c_15m < 15:
                         cantidad_velas_15m = c_15m
                         timestamp_last_15m = timestamp_15m + timedelta(minutes=cantidad_velas_15m-1)
+                        yyyy_15m = timestamp_15m.year
+                        mm_15m = timestamp_15m.month
+                        dd_15m = timestamp_15m.day
+                        hh_15m = timestamp_15m.hour
+                        timestamp_col_15m = timestamp_15m.astimezone(bogota_tz)
                         vela_15m = {
                             'ticker': ticker,
                             'timeframe': 15,
@@ -350,6 +303,11 @@ try:
                     if c_60m < 60:
                         cantidad_velas_60m = c_60m
                         timestamp_last_60m = timestamp_60m + timedelta(minutes=cantidad_velas_60m-1)
+                        yyyy_60m = timestamp_60m.year
+                        mm_60m = timestamp_60m.month
+                        dd_60m = timestamp_60m.day
+                        hh_60m = timestamp_60m.hour
+                        timestamp_col_60m = timestamp_60m.astimezone(bogota_tz)
                         vela_60m = {
                             'ticker': ticker,
                             'timeframe': 60,
@@ -381,6 +339,11 @@ try:
                     if c_240m < 240:
                         cantidad_velas_240m = c_240m
                         timestamp_last_240m = timestamp_240m + timedelta(minutes=cantidad_velas_240m-1)
+                        yyyy_240m = timestamp_240m.year
+                        mm_240m = timestamp_240m.month
+                        dd_240m = timestamp_240m.day
+                        hh_240m = timestamp_240m.hour
+                        timestamp_col_240m = timestamp_240m.astimezone(bogota_tz)
                         vela_240m = {
                             'ticker': ticker,
                             'timeframe': 240,
@@ -412,6 +375,11 @@ try:
                     if c_1440m < 1440:
                         cantidad_velas_1440m = c_1440m
                         timestamp_last_1440m = timestamp_1440m + timedelta(minutes=cantidad_velas_1440m-1)
+                        yyyy_1440m = timestamp_1440m.year
+                        mm_1440m = timestamp_1440m.month
+                        dd_1440m = timestamp_1440m.day
+                        hh_1440m = timestamp_1440m.hour
+                        timestamp_col_1440m = timestamp_1440m.astimezone(bogota_tz)
                         vela_1440m = {
                             'ticker': ticker,
                             'timeframe': 1440,
@@ -443,6 +411,11 @@ try:
                 if c_15m == 15:
                     cantidad_velas_15m = 15
                     timestamp_last_15m = timestamp_15m + timedelta(minutes=cantidad_velas_15m-1)
+                    yyyy_15m = timestamp_15m.year
+                    mm_15m = timestamp_15m.month
+                    dd_15m = timestamp_15m.day
+                    hh_15m = timestamp_15m.hour
+                    timestamp_col_15m = timestamp_15m.astimezone(bogota_tz)
                     vela_15m = {
                         'ticker': ticker,
                         'timeframe': 15,
@@ -476,16 +449,16 @@ try:
                     close_15m = None
                     volume_15m = 0.0
                     timestamp_15m = None
-                    timestamp_col_15m = None
-                    yyyy_15m = None
-                    mm_15m = None
-                    dd_15m = None
-                    hh_15m = None
 
                 # --- Cierre de vela de 60m ---
                 if c_60m == 60:
                     cantidad_velas_60m = 60
                     timestamp_last_60m = timestamp_60m + timedelta(minutes=cantidad_velas_60m-1)
+                    yyyy_60m = timestamp_60m.year
+                    mm_60m = timestamp_60m.month
+                    dd_60m = timestamp_60m.day
+                    hh_60m = timestamp_60m.hour
+                    timestamp_col_60m = timestamp_60m.astimezone(bogota_tz)
                     vela_60m = {
                         'ticker': ticker,
                         'timeframe': 60,
@@ -519,16 +492,16 @@ try:
                     close_60m = None
                     volume_60m = 0.0
                     timestamp_60m = None
-                    timestamp_col_60m = None
-                    yyyy_60m = None
-                    mm_60m = None
-                    dd_60m = None
-                    hh_60m = None
 
                 # --- Cierre de vela de 240m ---
                 if c_240m == 240:
                     cantidad_velas_240m = 240
                     timestamp_last_240m = timestamp_240m + timedelta(minutes=cantidad_velas_240m-1)
+                    yyyy_240m = timestamp_240m.year
+                    mm_240m = timestamp_240m.month
+                    dd_240m = timestamp_240m.day
+                    hh_240m = timestamp_240m.hour
+                    timestamp_col_240m = timestamp_240m.astimezone(bogota_tz)
                     vela_240m = {
                         'ticker': ticker,
                         'timeframe': 240,
@@ -562,16 +535,16 @@ try:
                     close_240m = None
                     volume_240m = 0.0
                     timestamp_240m = None
-                    timestamp_col_240m = None
-                    yyyy_240m = None
-                    mm_240m = None
-                    dd_240m = None
-                    hh_240m = None
 
                 # --- Cierre de vela de 1440m ---
                 if c_1440m == 1440:
                     cantidad_velas_1440m = 1440
                     timestamp_last_1440m = timestamp_1440m + timedelta(minutes=cantidad_velas_1440m-1)
+                    yyyy_1440m = timestamp_1440m.year
+                    mm_1440m = timestamp_1440m.month
+                    dd_1440m = timestamp_1440m.day
+                    hh_1440m = timestamp_1440m.hour
+                    timestamp_col_1440m = timestamp_1440m.astimezone(bogota_tz)
                     vela_1440m = {
                         'ticker': ticker,
                         'timeframe': 1440,
@@ -605,16 +578,16 @@ try:
                     close_1440m = None
                     volume_1440m = 0.0
                     timestamp_1440m = None
-                    timestamp_col_1440m = None
-                    yyyy_1440m = None
-                    mm_1440m = None
-                    dd_1440m = None
-                    hh_1440m = None
 
             # --- Final del día: velas parciales ---
             if buffer_5m:
                 cantidad_velas_5m = len(buffer_5m)
                 timestamp_last_5m = ts_first_5m + timedelta(minutes=cantidad_velas_5m-1)
+                yyyy_5m = ts_first_5m.year
+                mm_5m = ts_first_5m.month
+                dd_5m = ts_first_5m.day
+                hh_5m = ts_first_5m.hour
+                timestamp_col_5m = ts_first_5m.astimezone(bogota_tz)
                 ohlcv_5m = calc_ohlcv(buffer_5m)
                 vela_5m = {
                     'ticker': ticker,
@@ -645,6 +618,11 @@ try:
             if c_15m > 0 and c_15m < 15:
                 cantidad_velas_15m = c_15m
                 timestamp_last_15m = timestamp_15m + timedelta(minutes=cantidad_velas_15m-1)
+                yyyy_15m = timestamp_15m.year
+                mm_15m = timestamp_15m.month
+                dd_15m = timestamp_15m.day
+                hh_15m = timestamp_15m.hour
+                timestamp_col_15m = timestamp_15m.astimezone(bogota_tz)
                 vela_15m = {
                     'ticker': ticker,
                     'timeframe': 15,
@@ -674,6 +652,11 @@ try:
             if c_60m > 0 and c_60m < 60:
                 cantidad_velas_60m = c_60m
                 timestamp_last_60m = timestamp_60m + timedelta(minutes=cantidad_velas_60m-1)
+                yyyy_60m = timestamp_60m.year
+                mm_60m = timestamp_60m.month
+                dd_60m = timestamp_60m.day
+                hh_60m = timestamp_60m.hour
+                timestamp_col_60m = timestamp_60m.astimezone(bogota_tz)
                 vela_60m = {
                     'ticker': ticker,
                     'timeframe': 60,
@@ -703,6 +686,11 @@ try:
             if c_240m > 0 and c_240m < 240:
                 cantidad_velas_240m = c_240m
                 timestamp_last_240m = timestamp_240m + timedelta(minutes=cantidad_velas_240m-1)
+                yyyy_240m = timestamp_240m.year
+                mm_240m = timestamp_240m.month
+                dd_240m = timestamp_240m.day
+                hh_240m = timestamp_240m.hour
+                timestamp_col_240m = timestamp_240m.astimezone(bogota_tz)
                 vela_240m = {
                     'ticker': ticker,
                     'timeframe': 240,
@@ -732,6 +720,11 @@ try:
             if c_1440m > 0 and c_1440m < 1440:
                 cantidad_velas_1440m = c_1440m
                 timestamp_last_1440m = timestamp_1440m + timedelta(minutes=cantidad_velas_1440m-1)
+                yyyy_1440m = timestamp_1440m.year
+                mm_1440m = timestamp_1440m.month
+                dd_1440m = timestamp_1440m.day
+                hh_1440m = timestamp_1440m.hour
+                timestamp_col_1440m = timestamp_1440m.astimezone(bogota_tz)
                 vela_1440m = {
                     'ticker': ticker,
                     'timeframe': 1440,
