@@ -1,6 +1,7 @@
 # Nombre de archivo: pg_indicators_multi_ticker.py
 # Script para calcular indicadores históricos para múltiples tickers y timeframes.
 # Versión con ATR%, Volume Oscillator y precio_actual, adaptado para PostgreSQL
+# Modificado para manejar timestamp_col y timestamp_last
 
 import pandas as pd
 import psycopg2
@@ -129,7 +130,7 @@ def fetch_ohlcv_data(conn, ticker, timeframe_minutes, fetch_data_from_dt_utc, fe
     try:
         cursor = conn.cursor()
         query = """
-            SELECT timestamp, open, high, low, close, volume
+            SELECT timestamp, open, high, low, close, volume, timestamp_col, timestamp_last
             FROM ohlcv
             WHERE ticker = %s AND timeframe = %s AND timestamp >= %s AND timestamp < %s
             ORDER BY timestamp ASC
@@ -144,7 +145,7 @@ def fetch_ohlcv_data(conn, ticker, timeframe_minutes, fetch_data_from_dt_utc, fe
         data = cursor.fetchall()
         logger.info(f"OHLCV obtenidos para {ticker} TF:{timeframe_minutes}m: {len(data)} filas (Rango: {params[2]} a {params[3]})")
         if data:
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'timestamp_col', 'timestamp_last'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
@@ -153,6 +154,8 @@ def fetch_ohlcv_data(conn, ticker, timeframe_minutes, fetch_data_from_dt_utc, fe
                 df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
             else:
                 df['timestamp'] = df['timestamp'].dt.tz_convert('UTC')
+            df['timestamp_col'] = pd.to_datetime(df['timestamp_col'])
+            df['timestamp_last'] = pd.to_datetime(df['timestamp_last'])
             return df
         else:
             return pd.DataFrame()
@@ -272,13 +275,14 @@ def store_indicators(conn, full_indicators_df, ticker, timeframe_minutes,
     try:
         cursor = conn.cursor()
 
-        cols_to_store_in_df = ['timestamp', 'precio_actual'] + \
+        # --- Incluir los campos timestamp_col y timestamp_last en la inserción ---
+        cols_to_store_in_df = ['timestamp', 'timestamp_col', 'timestamp_last', 'precio_actual'] + \
                              [col for col in INDICATOR_COLUMN_NAMES if col in full_indicators_df.columns and col != 'precio_actual']
-        df_subset = df_day_to_store[cols_to_store_in_df].copy()
 
+        df_subset = df_day_to_store[cols_to_store_in_df].copy()
         df_subset = df_subset.replace({np.nan: None, pd.NaT: None})
 
-        indicator_cols_for_dropna = [col for col in cols_to_store_in_df if col != 'timestamp']
+        indicator_cols_for_dropna = [col for col in cols_to_store_in_df if col not in ['timestamp', 'timestamp_col', 'timestamp_last']]
         if not indicator_cols_for_dropna or df_subset.empty:
             return 0
         df_filtered = df_subset.dropna(subset=indicator_cols_for_dropna, how='all')
@@ -297,7 +301,7 @@ def store_indicators(conn, full_indicators_df, ticker, timeframe_minutes,
 
         sql_cols_str = ", ".join([f'"{col}"' for col in cols_to_store_in_df])
         sql_placeholders_str = ", ".join(["%s"] * (2 + len(cols_to_store_in_df)))
-        sql_update_parts = [f'"{db_col}" = EXCLUDED."{db_col}"' for db_col in cols_to_store_in_df if db_col != 'timestamp']
+        sql_update_parts = [f'"{db_col}" = EXCLUDED."{db_col}"' for db_col in cols_to_store_in_df if db_col not in ['timestamp']]
         sql_update_str = ", ".join(sql_update_parts)
 
         sql_base = (f'INSERT INTO indicadores ("ticker", "timeframe", {sql_cols_str}) '
@@ -334,8 +338,8 @@ def store_indicators(conn, full_indicators_df, ticker, timeframe_minutes,
 
 # --- Función Principal ---
 def main():
-    OVERALL_STORAGE_START_DATE_STR = "2025-05-01"
-    OVERALL_STORAGE_END_DATE_STR = "2025-06-01"
+    OVERALL_STORAGE_START_DATE_STR = "2023-01-01"
+    OVERALL_STORAGE_END_DATE_STR = "2023-02-01"
 
     overall_storage_start_dt_utc = datetime.strptime(OVERALL_STORAGE_START_DATE_STR, "%Y-%m-%d").replace(
         hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC
@@ -387,6 +391,12 @@ def main():
                     continue
 
                 indicators_df_full = calculate_indicators(ohlcv_df, ticker_to_process_loop, tf_minutes)
+
+                # Asegurarse de que timestamp_col y timestamp_last estén presentes
+                if 'timestamp_col' not in indicators_df_full.columns:
+                    indicators_df_full['timestamp_col'] = ohlcv_df['timestamp_col']
+                if 'timestamp_last' not in indicators_df_full.columns:
+                    indicators_df_full['timestamp_last'] = ohlcv_df['timestamp_last']
 
                 calculated_indicator_cols_present = [col for col in INDICATOR_COLUMN_NAMES if col in indicators_df_full.columns]
                 if indicators_df_full.empty or not calculated_indicator_cols_present:
