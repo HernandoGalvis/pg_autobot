@@ -211,8 +211,8 @@ def main():
             return
         print(f"Tickers base a procesar: {symbols_in_db}")
 
-        year_start_dt = datetime(2023, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
-        year_end_dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
+        year_start_dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
+        year_end_dt = datetime(2025, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
 
         total_days = (year_end_dt - year_start_dt).days
         if total_days <= 0:
