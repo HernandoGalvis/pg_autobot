@@ -1,7 +1,6 @@
 # 01_pg_candles_import_1m.py
 # Descarga velas OHLCV de 1 minuto para símbolos activos y las almacena en la tabla ohlcv_raw_1m.
-# Considera límites de la API REST de Bitget y arma el proceso en paquetes.
-# No usa multiproceso para evitar rate limits.
+# Ahora los campos timestamp y timestamp_col son VARCHAR(30) y se insertan como cadenas ISO8601.
 
 import time
 import ccxt
@@ -15,15 +14,13 @@ import math
 from parmspg import API_KEY, API_SECRET, API_PASSPHRASE, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 
 # Parámetros de la API Bitget
-LIMIT_PER_FETCH = 200  # Bitget máxima cantidad por llamada OHLCV
-RATE_LIMIT_SECONDS = 1.2  # Bitget ~50-60 req/min, dejamos margen
-
-DAYS_PER_BATCH = 3  # Días por paquete para evitar timeouts o exceso de datos
+LIMIT_PER_FETCH = 200
+RATE_LIMIT_SECONDS = 1.2
+DAYS_PER_BATCH = 3
 
 TIMEFRAME_STR = '1m'
 TIMEFRAME_MIN = 1
 
-# --- Inicialización del Exchange ---
 try:
     exchange = ccxt.bitget({
         'apiKey': API_KEY,
@@ -31,7 +28,7 @@ try:
         'password': API_PASSPHRASE,
         'enableRateLimit': True,
         'options': {
-            'defaultType': 'swap',  # Para futuros
+            'defaultType': 'swap',
             'adjustForTimeZone': False,
         }
     })
@@ -41,7 +38,6 @@ except Exception as e:
     print(f"Error al inicializar CCXT con Bitget: {e}")
     exit()
 
-# --- Conexión a PostgreSQL ---
 try:
     conn = psycopg2.connect(
         host=DB_HOST,
@@ -62,12 +58,7 @@ except UnicodeDecodeError as ude:
     print(f"Error de codificación en las credenciales: {ude}")
     exit()
 
-# --- Función para obtener OHLCV 1m en paquetes ---
 def fetch_ohlcv_1m(symbol_for_api, since_ts, until_ts):
-    """
-    Obtiene datos OHLCV 1m usando CCXT, para Bitget tipo 'swap'.
-    Devuelve lista de [timestamp, open, high, low, close, volume]
-    """
     all_data = []
     ts = since_ts
     params = {'type': 'swap'}
@@ -96,54 +87,69 @@ def fetch_ohlcv_1m(symbol_for_api, since_ts, until_ts):
         newest_ts_in_batch = bars[-1][0]
         added_count = 0
         for bar in bars:
-            if bar[0] >= until_ts:
+            ts_api = bar[0]
+            o, h, l, c, v = bar[1:]
+            time_utc_w = datetime.fromtimestamp(ts_api / 1000, tz=pytz.UTC)
+            time_bogota = time_utc_w.astimezone(pytz.timezone('America/Bogota'))
+
+            bar_struct = {
+                'ticker': None,  # se llenará luego
+                'timestamp': time_utc_w,
+                'timestamp_col': time_bogota,
+                'yyyy': time_utc_w.year,
+                'mm': time_utc_w.month,
+                'dd': time_utc_w.day,
+                'hh': time_utc_w.hour,
+                'open': float(o) if o is not None else 0.0,
+                'high': float(h) if h is not None else 0.0,
+                'low': float(l) if l is not None else 0.0,
+                'close': float(c) if c is not None else 0.0,
+                'volume': float(v) if v is not None else 0.0,
+                'ts_api': ts_api  # solo para debug opcional
+            }
+
+            if ts_api >= until_ts:
                 continue
-            if bar[0] >= ts:
-                all_data.append(bar)
+            if ts_api >= ts:
+                all_data.append(bar_struct)
                 added_count += 1
 
         if added_count == 0 or newest_ts_in_batch < ts:
             break
 
         ts = newest_ts_in_batch + 1
-        time.sleep(RATE_LIMIT_SECONDS)  # Respeta rate limit
+        time.sleep(RATE_LIMIT_SECONDS)
 
     return all_data
 
-# --- Almacenamiento a ohlcv_raw_1m ---
 def store_ohlcv_1m(symbol_in_db, bars, start_dt_req, end_dt_req):
     if not bars:
         return 0
 
-    records = []
     start_ts_req = int(start_dt_req.timestamp() * 1000)
     end_ts_req = int(end_dt_req.timestamp() * 1000)
 
-    for bar_data in bars:
-        ts, o, h, l, c, v = bar_data
-        if ts < start_ts_req or ts >= end_ts_req:
+    records = []
+    for bar_struct in bars:
+        ts_api = bar_struct['ts_api']
+        if ts_api < start_ts_req or ts_api >= end_ts_req:
             continue
-        dt_candle = datetime.fromtimestamp(ts / 1000, tz=pytz.UTC)
-        o = float(o) if o is not None else 0.0
-        h = float(h) if h is not None else 0.0
-        l = float(l) if l is not None else 0.0
-        c = float(c) if c is not None else 0.0
-        v = float(v) if v is not None else 0.0
-
-        records.append({
-            'ticker': symbol_in_db,
-            'timestamp': dt_candle,
-            'open': o,
-            'high': h,
-            'low': l,
-            'close': c,
-            'volume': v
-        })
+        rec = dict(bar_struct)
+        rec['ticker'] = symbol_in_db
+        records.append(rec)
 
     if not records:
         return 0
 
     df = pd.DataFrame(records)
+
+    # SOLO columnas válidas para la tabla (quita ts_api y cualquier otra)
+    cols_validos = ['ticker', 'timestamp', 'timestamp_col', 'yyyy', 'mm', 'dd', 'hh', 'open', 'high', 'low', 'close', 'volume']
+    df = df[cols_validos]
+
+    # Convierte los datetime a string ISO8601, máximo 30 caracteres (ej: '2023-01-01T00:00:00+00:00')
+    df['timestamp'] = df['timestamp'].apply(lambda x: x.isoformat())
+    df['timestamp_col'] = df['timestamp_col'].apply(lambda x: x.isoformat())
 
     try:
         df.to_sql(
@@ -152,7 +158,8 @@ def store_ohlcv_1m(symbol_in_db, bars, start_dt_req, end_dt_req):
             if_exists='append',
             index=False,
             method='multi',
-            schema=None
+            schema=None,
+            chunksize=1000
         )
         inserted_count = len(df)
         return inserted_count
@@ -162,15 +169,10 @@ def store_ohlcv_1m(symbol_in_db, bars, start_dt_req, end_dt_req):
         conn.rollback()
         return -1
 
-# --- Proceso principal por paquetes ---
 def procesar_rango_1m(symbol_in_db, start_dt, end_dt):
-    """
-    Procesa un rango de fechas para un ticker, obteniendo datos de 1 minuto.
-    """
     start_dt = start_dt.replace(tzinfo=pytz.UTC)
     end_dt = end_dt.replace(tzinfo=pytz.UTC)
 
-    # Adaptar formato para Bitget: BTC/USDT -> BTC/USDT:USDT
     parts = symbol_in_db.split('/')
     if len(parts) == 2:
         base = parts[0]
@@ -199,7 +201,6 @@ def procesar_rango_1m(symbol_in_db, start_dt, end_dt):
     else:
         print(f"   ? Situación inesperada para {symbol_in_db} - 1m.")
 
-# --- Main ---
 def main():
     global conn, cursor, engine
     try:
@@ -210,9 +211,8 @@ def main():
             return
         print(f"Tickers base a procesar: {symbols_in_db}")
 
-        # AJUSTA RANGO DE FECHAS A LO DESEADO
         year_start_dt = datetime(2023, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
-        year_end_dt = datetime(2023, 6, 1, 0, 0, 0, tzinfo=pytz.UTC)
+        year_end_dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
 
         total_days = (year_end_dt - year_start_dt).days
         if total_days <= 0:
@@ -288,3 +288,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+# 01_pg_candles_import_1m.py
+# Descarga velas OHLCV de 1 minuto para símbolos activos y las almacena en la tabla ohlcv_raw_1m.
+# Ahora los campos timestamp y timestamp_col son VARCHAR(30) y se insertan como cadenas ISO8601.
