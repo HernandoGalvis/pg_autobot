@@ -1,7 +1,7 @@
-# Nombre de archivo: pg_indicators_multi_ticker.py
+# Nombre de archivo: 02_pg_indicators_multi_ticker.py
 # Script para calcular indicadores históricos para múltiples tickers y timeframes.
-# Versión con ATR%, Volume Oscillator y precio_actual, adaptado para PostgreSQL
-# Modificado para manejar timestamp_col y timestamp_last
+# Referencia principal de fecha: timestamp_last.
+# timestamp_col se mantiene igual al valor leído desde OHLCV, sin recalcular, ni cambiar timezone.
 
 import pandas as pd
 import psycopg2
@@ -132,8 +132,8 @@ def fetch_ohlcv_data(conn, ticker, timeframe_minutes, fetch_data_from_dt_utc, fe
         query = """
             SELECT timestamp, open, high, low, close, volume, timestamp_col, timestamp_last
             FROM ohlcv
-            WHERE ticker = %s AND timeframe = %s AND timestamp >= %s AND timestamp < %s
-            ORDER BY timestamp ASC
+            WHERE ticker = %s AND timeframe = %s AND timestamp_last >= %s AND timestamp_last < %s
+            ORDER BY timestamp_last ASC, timeframe ASC
         """
         params = [
             ticker,
@@ -149,13 +149,10 @@ def fetch_ohlcv_data(conn, ticker, timeframe_minutes, fetch_data_from_dt_utc, fe
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            if df['timestamp'].dt.tz is None:
-                df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
-            else:
-                df['timestamp'] = df['timestamp'].dt.tz_convert('UTC')
-            df['timestamp_col'] = pd.to_datetime(df['timestamp_col'])
-            df['timestamp_last'] = pd.to_datetime(df['timestamp_last'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            df['timestamp_col'] = pd.to_datetime(df['timestamp_col'], utc=True)
+            df['timestamp_last'] = pd.to_datetime(df['timestamp_last'], utc=True)
+            df = df.sort_values(['timestamp_last', 'timeframe' if 'timeframe' in df.columns else 'timestamp'], ascending=[True, True]).reset_index(drop=True)
             return df
         else:
             return pd.DataFrame()
@@ -263,9 +260,13 @@ def store_indicators(conn, full_indicators_df, ticker, timeframe_minutes,
     if full_indicators_df.empty:
         return 0
 
+    # --- Asegurar que timestamp_last es siempre tz-aware UTC ---
+    full_indicators_df['timestamp_last'] = pd.to_datetime(full_indicators_df['timestamp_last'], utc=True)
+
+    # Filtro de almacenamiento diario usando timestamp_last
     df_day_to_store = full_indicators_df[
-        (full_indicators_df['timestamp'] >= day_storage_start_dt_utc) &
-        (full_indicators_df['timestamp'] < day_storage_end_dt_utc)
+        (full_indicators_df['timestamp_last'] >= day_storage_start_dt_utc) &
+        (full_indicators_df['timestamp_last'] < day_storage_end_dt_utc)
     ].copy()
 
     if df_day_to_store.empty:
@@ -339,7 +340,7 @@ def store_indicators(conn, full_indicators_df, ticker, timeframe_minutes,
 # --- Función Principal ---
 def main():
     OVERALL_STORAGE_START_DATE_STR = "2023-01-01"
-    OVERALL_STORAGE_END_DATE_STR = "2023-02-01"
+    OVERALL_STORAGE_END_DATE_STR = "2025-06-01"
 
     overall_storage_start_dt_utc = datetime.strptime(OVERALL_STORAGE_START_DATE_STR, "%Y-%m-%d").replace(
         hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC
@@ -398,6 +399,10 @@ def main():
                 if 'timestamp_last' not in indicators_df_full.columns:
                     indicators_df_full['timestamp_last'] = ohlcv_df['timestamp_last']
 
+                # timestamp será el cierre del bloque (timestamp_last)
+                indicators_df_full['timestamp'] = indicators_df_full['timestamp_last']
+                # timestamp_col se deja igual, como viene de OHLCV
+
                 calculated_indicator_cols_present = [col for col in INDICATOR_COLUMN_NAMES if col in indicators_df_full.columns]
                 if indicators_df_full.empty or not calculated_indicator_cols_present:
                     logger.warning(f"Cálculo de indicadores no produjo resultados para {ticker_to_process_loop} TF:{tf_minutes}m. Saltando almacenamiento.")
@@ -416,7 +421,7 @@ def main():
 
                     current_day_to_process_utc += timedelta(days=1)
 
-                logger.info(f"Procesados {total_rows_affected_timeframe} registros de indicadores para {ticker_to_process_loop} TF:{tf_minutes}m desde {overall_storage_start_dt_utc.strftime('%Y-%m-%d')} hasta {overall_storage_end_dt_inclusive_utc.strftime('%Y-%m-%d')}.")
+                logger.info(f"Procesados {total_rows_affected_timeframe} registros de indicadores para {ticker_to_process_loop} TF:{tf_minutes}m desde {overall_storage_start_dt_utc.strftime('%Y-%m-%d')} hasta {overall_storage_end_dt_inclusive_utc.strftime('%Y-%m-%d')}")
 
         logger.info("Procesamiento histórico de todos los tickers y timeframes completado.")
 
