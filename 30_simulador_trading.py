@@ -6,8 +6,11 @@
 #              Optimiza validación usando arreglo en memoria para operaciones abiertas y diccionario para conteo diario.
 #              Corrige bug de tipos numpy/pandas en inserts SQL.
 #              Corrige bug: convierte todos los parámetros a tipos Python nativos antes de cualquier insert/update SQL.
-# Versión: 1.3.3
-# Fecha: 2025-06-13
+#              MODIFICADO: Registra id_estrategia_fk en log_operaciones_simuladas.
+#              MODIFICADO: Calcula y registra duracion_operacion (minutos) y porc_sl/porc_tp (%) en operaciones_simuladas y log.
+#              CONFIRMADO: SOLO considera inversionistas activos y estrategias activas.
+# Versión: 1.3.7
+# Fecha: 2025-06-15
 # Autor: Hernando Galvis
 # ===============================================================================
 
@@ -72,7 +75,7 @@ def cargar_inversionista_ticker(engine, id_inversionista, ticker):
     return None
 
 def cargar_senales_activas(engine, tickers=None, fecha_inicio=None, fecha_fin=None):
-    # Solo señales de estrategias activas (campo booleano)
+    # Solo señales de estrategias activas (campo activa = TRUE)
     query = """
     SELECT sg.* FROM senales_generadas sg
     JOIN estrategias e ON sg.id_estrategia_fk = e.id_estrategia
@@ -119,11 +122,34 @@ def extract_ymd(ts):
         ts = pd.to_datetime(ts)
     return ts.year, ts.month, ts.day
 
+def calcular_duracion_operacion_minutos(ts_apertura, ts_cierre):
+    if ts_apertura is None or ts_cierre is None:
+        return None
+    if isinstance(ts_apertura, str):
+        ts_apertura = pd.to_datetime(ts_apertura)
+    if isinstance(ts_cierre, str):
+        ts_cierre = pd.to_datetime(ts_cierre)
+    return int((ts_cierre - ts_apertura).total_seconds() // 60)
+
+def calcular_porc_sl_tp(precio_entrada, sl, tp):
+    porc_sl = None
+    porc_tp = None
+    try:
+        if precio_entrada and sl is not None:
+            porc_sl = abs(precio_entrada - sl) / precio_entrada * 100
+        if precio_entrada and tp is not None:
+            porc_tp = abs(tp - precio_entrada) / precio_entrada * 100
+    except Exception:
+        porc_sl = None
+        porc_tp = None
+    return porc_sl, porc_tp
+
 def registrar_log_operacion(
-    session, tipo_evento, id_inversionista, id_senal, id_operacion, ticker,
+    session, tipo_evento, id_inversionista, id_estrategia, id_senal, id_operacion, ticker,
     detalle, capital_antes, capital_despues, precio_senal, sl, tp, cantidad,
     timestamp_apertura=None, timestamp_cierre=None, motivo_no_operacion=None,
-    resultado=None, motivo_cierre=None, precio_cierre=None
+    resultado=None, motivo_cierre=None, precio_cierre=None,
+    duracion_operacion=None, porc_sl=None, porc_tp=None
 ):
     yyyy_open, mm_open, dd_open = extract_ymd(timestamp_apertura)
     yyyy_close, mm_close, dd_close = extract_ymd(timestamp_cierre)
@@ -131,6 +157,7 @@ def registrar_log_operacion(
     params = {
         "timestamp_evento": datetime.now(),
         "id_inversionista_fk": py_native(id_inversionista),
+        "id_estrategia_fk": py_native(id_estrategia),
         "id_senal_fk": py_native(id_senal),
         "id_operacion_fk": py_native(id_operacion),
         "ticker": ticker,
@@ -151,20 +178,25 @@ def registrar_log_operacion(
         "motivo_no_operacion": motivo_no_operacion,
         "resultado": py_native(resultado),
         "motivo_cierre": motivo_cierre,
-        "precio_cierre": py_native(precio_cierre)
+        "precio_cierre": py_native(precio_cierre),
+        "duracion_operacion": py_native(duracion_operacion),
+        "porc_sl": py_native(porc_sl),
+        "porc_tp": py_native(porc_tp)
     }
     params = py_native_dict(params)
     ins = text("""
     INSERT INTO log_operaciones_simuladas (
-        timestamp_evento, id_inversionista_fk, id_senal_fk, id_operacion_fk, ticker, tipo_evento,
+        timestamp_evento, id_inversionista_fk, id_estrategia_fk, id_senal_fk, id_operacion_fk, ticker, tipo_evento,
         detalle, capital_antes, capital_despues, precio_senal, sl, tp, cantidad,
         yyyy_open, mm_open, dd_open, yyyy_close, mm_close, dd_close,
-        motivo_no_operacion, resultado, motivo_cierre, precio_cierre
+        motivo_no_operacion, resultado, motivo_cierre, precio_cierre,
+        duracion_operacion, porc_sl, porc_tp
     ) VALUES (
-        :timestamp_evento, :id_inversionista_fk, :id_senal_fk, :id_operacion_fk, :ticker, :tipo_evento,
+        :timestamp_evento, :id_inversionista_fk, :id_estrategia_fk, :id_senal_fk, :id_operacion_fk, :ticker, :tipo_evento,
         :detalle, :capital_antes, :capital_despues, :precio_senal, :sl, :tp, :cantidad,
         :yyyy_open, :mm_open, :dd_open, :yyyy_close, :mm_close, :dd_close,
-        :motivo_no_operacion, :resultado, :motivo_cierre, :precio_cierre
+        :motivo_no_operacion, :resultado, :motivo_cierre, :precio_cierre,
+        :duracion_operacion, :porc_sl, :porc_tp
     )
     """)
     session.execute(ins, params)
@@ -215,11 +247,12 @@ def simular():
                     count_diario = operaciones_diarias_count.get(key_diaria, 0)
                     if count_diario >= limite_diario_operaciones:
                         registrar_log_operacion(
-                            session, "no_operacion", inv['id_inversionista'], senal['id_senal'], None, ticker,
+                            session, "no_operacion", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], None, ticker,
                             f"Límite diario de operaciones ({limite_diario_operaciones}) para este ticker alcanzado.",
                             capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                             timestamp_apertura=senal["timestamp_senal"],
-                            motivo_no_operacion="limite_diario_operaciones"
+                            motivo_no_operacion="limite_diario_operaciones",
+                            duracion_operacion=None, porc_sl=None, porc_tp=None
                         )
                         continue
 
@@ -229,11 +262,12 @@ def simular():
                     ]
                     if len(abiertas_este_ticker) >= limite_operaciones_abiertas:
                         registrar_log_operacion(
-                            session, "no_operacion", inv['id_inversionista'], senal['id_senal'], None, ticker,
+                            session, "no_operacion", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], None, ticker,
                             f"Límite de operaciones abiertas simultáneas ({limite_operaciones_abiertas}) para este ticker alcanzado.",
                             capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                             timestamp_apertura=senal["timestamp_senal"],
-                            motivo_no_operacion="limite_operaciones_abiertas"
+                            motivo_no_operacion="limite_operaciones_abiertas",
+                            duracion_operacion=None, porc_sl=None, porc_tp=None
                         )
                         continue
 
@@ -242,10 +276,11 @@ def simular():
                     precio = float(senal["precio_senal"] or 0)
                     if not precio or precio <= 0:
                         registrar_log_operacion(
-                            session, "no_operacion", inv['id_inversionista'], senal['id_senal'], None, ticker,
+                            session, "no_operacion", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], None, ticker,
                             "Precio de señal inválido o nulo", capital_antes, capital_actual, precio,
                             None, None, None, timestamp_apertura=senal['timestamp_senal'],
-                            motivo_no_operacion="precio_invalido"
+                            motivo_no_operacion="precio_invalido",
+                            duracion_operacion=None, porc_sl=None, porc_tp=None
                         )
                         continue
 
@@ -263,10 +298,11 @@ def simular():
                         msg = f"{inv['nombre']} sin capital suficiente para operar. Fin de simulación para este inversionista."
                         logging.warning(msg)
                         registrar_log_operacion(
-                            session, "no_operacion", inv['id_inversionista'], senal['id_senal'], None, ticker,
+                            session, "no_operacion", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], None, ticker,
                             msg, capital_antes, capital_actual, precio, None, None, None,
                             timestamp_apertura=senal['timestamp_senal'],
-                            motivo_no_operacion="capital_insuficiente"
+                            motivo_no_operacion="capital_insuficiente",
+                            duracion_operacion=None, porc_sl=None, porc_tp=None
                         )
                         break
 
@@ -305,6 +341,9 @@ def simular():
                         apalancamiento = int(inv.get("apalancamiento_max", 1))
                         origen_parametros = "inversionista"
 
+                    # ======= Cálculo de porc_sl y porc_tp (%) respecto a precio_entrada =======
+                    porc_sl, porc_tp = calcular_porc_sl_tp(precio, sl, tp)
+
                     ins_op = text("""
                     INSERT INTO operaciones_simuladas (
                         id_inversionista_fk, id_estrategia_fk, id_senal_fk, ticker_fk, timestamp_apertura,
@@ -312,14 +351,16 @@ def simular():
                         capital_bloqueado,
                         stop_loss_price, take_profit_price, atr_percent_usado, mult_sl_asignado, mult_tp_asignado,
                         origen_parametros,
-                        yyyy_open, mm_open, dd_open
+                        yyyy_open, mm_open, dd_open,
+                        porc_sl, porc_tp
                     ) VALUES (
                         :id_inversionista, :id_estrategia, :id_senal, :ticker, :timestamp_apertura,
                         :precio_entrada, :cantidad, :apalancamiento, :tipo_operacion, :capital_riesgo_usado,
                         :capital_bloqueado,
                         :stop_loss_price, :take_profit_price, :atr_percent_usado, :mult_sl_asignado, :mult_tp_asignado,
                         :origen_parametros,
-                        :yyyy_open, :mm_open, :dd_open
+                        :yyyy_open, :mm_open, :dd_open,
+                        :porc_sl, :porc_tp
                     ) RETURNING id_operacion
                     """)
                     # --- CONVIERTE TODOS LOS PARÁMETROS A TIPOS PYTHON NATIVOS ---
@@ -343,17 +384,20 @@ def simular():
                         "origen_parametros": origen_parametros,
                         "yyyy_open": yyyy_open,
                         "mm_open": mm_open,
-                        "dd_open": dd_open
+                        "dd_open": dd_open,
+                        "porc_sl": porc_sl,
+                        "porc_tp": porc_tp
                     }
                     op_params = py_native_dict(op_params)
                     op_res = session.execute(ins_op, op_params)
                     id_operacion = op_res.fetchone()[0]
                     session.commit()
                     registrar_log_operacion(
-                        session, "apertura", inv['id_inversionista'], senal['id_senal'], id_operacion, ticker,
-                        f"Operación abierta (SL:{sl}, TP:{tp}, origen:{origen_parametros}, monto_usd:{monto_usd}, cantidad:{cantidad})",
+                        session, "apertura", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], id_operacion, ticker,
+                        f"Operación abierta (SL:{sl}, TP:{tp}, origen:{origen_parametros}, monto_usd:{monto_usd}, cantidad:{cantidad}, porc_sl:{porc_sl}, porc_tp:{porc_tp})",
                         capital_antes, capital_actual, precio, sl, tp, cantidad,
-                        timestamp_apertura=senal['timestamp_senal']
+                        timestamp_apertura=senal['timestamp_senal'],
+                        duracion_operacion=None, porc_sl=porc_sl, porc_tp=porc_tp
                     )
                     # --- AGREGAR OPERACIÓN AL ARREGLO EN MEMORIA ---
                     operaciones_abiertas_mem.append({
@@ -394,6 +438,17 @@ def simular():
 
                     yyyy_close, mm_close, dd_close = extract_ymd(cierre_timestamp)
 
+                    # ======= Cálculo de duración y porcentajes =======
+                    duracion_operacion = None
+                    if cierre_timestamp is not None and senal['timestamp_senal'] is not None:
+                        duracion_operacion = calcular_duracion_operacion_minutos(senal['timestamp_senal'], cierre_timestamp)
+                    # Recalcula por si el SL/TP fue movido (en este caso no debería, pero es seguro)
+                    porc_sl_cierre, porc_tp_cierre = calcular_porc_sl_tp(precio, sl, tp)
+                    if porc_sl_cierre is None:
+                        porc_sl_cierre = porc_sl
+                    if porc_tp_cierre is None:
+                        porc_tp_cierre = porc_tp
+
                     if cierre_precio is not None:
                         if senal["tipo_senal"].upper() == "LONG":
                             resultado = (cierre_precio - precio) * cantidad
@@ -410,7 +465,10 @@ def simular():
                             motivo_cierre = :motivo_cierre,
                             yyyy_close = :yyyy_close,
                             mm_close = :mm_close,
-                            dd_close = :dd_close
+                            dd_close = :dd_close,
+                            duracion_operacion = :duracion_operacion,
+                            porc_sl = :porc_sl,
+                            porc_tp = :porc_tp
                         WHERE id_operacion = :id_operacion
                     """)
                     up_params = {
@@ -420,18 +478,22 @@ def simular():
                         "yyyy_close": py_native(yyyy_close),
                         "mm_close": py_native(mm_close),
                         "dd_close": py_native(dd_close),
+                        "duracion_operacion": py_native(duracion_operacion),
+                        "porc_sl": py_native(porc_sl_cierre),
+                        "porc_tp": py_native(porc_tp_cierre),
                         "id_operacion": id_operacion,
                     }
                     up_params = py_native_dict(up_params)
                     session.execute(up_op, up_params)
                     session.commit()
                     registrar_log_operacion(
-                        session, "cierre", inv['id_inversionista'], senal['id_senal'], id_operacion, ticker,
-                        f"Cierre de operación {id_operacion}: {motivo_cierre} en {cierre_timestamp}, precio {cierre_precio}",
+                        session, "cierre", inv['id_inversionista'], senal['id_estrategia_fk'], senal['id_senal'], id_operacion, ticker,
+                        f"Cierre de operación {id_operacion}: {motivo_cierre} en {cierre_timestamp}, precio {cierre_precio}, duración: {duracion_operacion} minutos, porc_sl: {porc_sl_cierre}, porc_tp: {porc_tp_cierre}",
                         capital_antes, capital_actual, precio, sl, tp, cantidad,
                         timestamp_apertura=senal['timestamp_senal'],
                         timestamp_cierre=cierre_timestamp,
-                        motivo_cierre=motivo_cierre, resultado=resultado, precio_cierre=cierre_precio
+                        motivo_cierre=motivo_cierre, resultado=resultado, precio_cierre=cierre_precio,
+                        duracion_operacion=duracion_operacion, porc_sl=porc_sl_cierre, porc_tp=porc_tp_cierre
                     )
                     # --- REMOVER OPERACIÓN DEL ARREGLO EN MEMORIA AL CERRARLA ---
                     operaciones_abiertas_mem = [
@@ -444,10 +506,11 @@ def simular():
                     error_msg = f"Error en operación: {e}\n{tb}"
                     logging.error(error_msg)
                     registrar_log_operacion(
-                        session, "error", inv['id_inversionista'], senal.get('id_senal'), None, ticker,
+                        session, "error", inv['id_inversionista'], senal.get('id_estrategia_fk'), senal.get('id_senal'), None, ticker,
                         error_msg, capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                         timestamp_apertura=senal.get('timestamp_senal'),
-                        motivo_no_operacion="error"
+                        motivo_no_operacion="error",
+                        duracion_operacion=None, porc_sl=None, porc_tp=None
                     )
 
             logging.info(f"Capital final para {inv['nombre']}: {capital_actual}")
@@ -458,9 +521,10 @@ def simular():
         error_msg = f"Error en simulador principal: {e}\n{tb}"
         logging.error(error_msg)
         registrar_log_operacion(
-            session, "error", None, None, None, None,
+            session, "error", None, None, None, None, None,
             error_msg, None, None, None, None, None, None,
-            motivo_no_operacion="error_global"
+            motivo_no_operacion="error_global",
+            duracion_operacion=None, porc_sl=None, porc_tp=None
         )
 
     finally:
