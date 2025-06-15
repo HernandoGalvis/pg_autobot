@@ -6,7 +6,7 @@
 #   Señales viables se insertan en senales_generadas,
 #   señales no viables en senales_no_viables.
 #   Permite delimitar por fecha y recorre la tabla INDICADORES (5min) como guía temporal.
-# Versión: 1.2.5   (2025-06-10)
+# Versión: 1.2.8   (2025-06-11)
 # ===========================================================
 
 import sys
@@ -36,7 +36,7 @@ def get_engine(parmspg):
     url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
     return create_engine(url)
 
-SCRIPT_VERSION = "1.2.5"
+SCRIPT_VERSION = "1.2.8"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,8 +137,8 @@ def evaluar_regla(regla, data_valor, op_python_map):
         return False
 
 def main():
-    fecha_inicio = datetime.datetime(2025, 1, 1, 0, 0, 0)
-    fecha_fin    = datetime.datetime(2025, 6, 10, 0, 0, 0)
+    fecha_inicio = datetime.datetime(2025, 4, 1, 0, 0, 0)
+    fecha_fin    = datetime.datetime(2025, 5, 1, 0, 0, 0)
     timeframe_base = 5
     tickers_filtrar = None
 
@@ -170,9 +170,10 @@ def main():
                     timestamps = get_timestamps_for_ticker_indicadores(
                         conn, metadata, ticker, timeframe_base, fecha_inicio, fecha_fin
                     )
+                    fecha_actual_commit = None
                     for ts in timestamps:
                         try:
-                            resultado, es_viable, motivo_no_viable, detalle_no_viable = procesar_estrategia_sobre_timestamp(
+                            resultado, es_viable, motivo_no_viable, detalle_no_viable, calificacion_pct_nv = procesar_estrategia_sobre_timestamp(
                                 conn, metadata, estrategia, reglas_resumen, reglas_alertas, reglas_indicadores,
                                 ticker, ts, op_python_map, estados_senales
                             )
@@ -180,9 +181,21 @@ def main():
                                 if es_viable:
                                     insertar_senal(conn, metadata, resultado)
                                 else:
-                                    insertar_senal_no_viable(conn, metadata, resultado, motivo_no_viable, detalle_no_viable)
+                                    insertar_senal_no_viable(conn, metadata, resultado, motivo_no_viable, detalle_no_viable, calificacion_pct_nv)
                         except Exception as ex:
                             logger.error(f"Error procesando señal para {ticker} ts={ts}: {ex}")
+
+                        # COMMIT diario para evitar acumulación excesiva
+                        if ts is not None:
+                            ts_date = ts.date()
+                            if fecha_actual_commit is None:
+                                fecha_actual_commit = ts_date
+                            elif ts_date != fecha_actual_commit:
+                                trans.commit()
+                                trans = conn.begin()
+                                fecha_actual_commit = ts_date
+
+            # Commit final
             trans.commit()
             logger.info(f"FIN DE SCRIPT v{SCRIPT_VERSION} - Proceso completado.")
         except Exception as ex:
@@ -320,8 +333,35 @@ def procesar_estrategia_sobre_timestamp(
     else:
         id_estado_senal = 1
 
-    precio_senal = ind_dict.get('precio_actual') if ind_dict else None
-    atr_percent_usado = ind_dict.get('atr_percent') if ind_dict else None
+    # === NUEVO: Cálculo de SL, TP, apalancamiento, multiplicadores y ATR ===
+    precio_actual = ind_dict.get('precio_actual')
+    atr_percent = ind_dict.get('atr_percent')
+    mult_sl = estrategia.get('sl_atr_mult', 1.0)
+    mult_tp = estrategia.get('tp_atr_mult', 1.0)
+    tipo_operacion = estrategia['tipo_operacion'] or ''
+    stop_loss_price = None
+    target_profit_price = None
+
+    if precio_actual is not None and atr_percent is not None:
+        try:
+            precio_actual = float(precio_actual)
+            atr_percent_val = float(atr_percent) / 100  # ATR percent viene como 1.45 para 1.45%
+            sl_dist = precio_actual * atr_percent_val * float(mult_sl)
+            tp_dist = precio_actual * atr_percent_val * float(mult_tp)
+            if tipo_operacion.upper() == 'LONG':
+                stop_loss_price = precio_actual - sl_dist
+                target_profit_price = precio_actual + tp_dist
+            elif tipo_operacion.upper() == 'SHORT':
+                stop_loss_price = precio_actual + sl_dist
+                target_profit_price = precio_actual - tp_dist
+
+            # No permitir precios negativos o absurdos
+            if stop_loss_price is not None and stop_loss_price <= 0:
+                stop_loss_price = None
+            if target_profit_price is not None and target_profit_price <= 0:
+                target_profit_price = None
+        except Exception as ex:
+            logger.error(f"Error calculando SL/TP para {ticker} ts={ts}: {ex}")
 
     yyyy, mm, dd, hh, min_ = None, None, None, None, None
     if ts is not None:
@@ -335,31 +375,29 @@ def procesar_estrategia_sobre_timestamp(
         'id_estrategia_fk': estrategia['id_estrategia'],
         'ticker_fk': ticker,
         'timestamp_senal': ts,
-        'tipo_senal': estrategia['tipo_operacion'] or '',
+        'tipo_senal': tipo_operacion,
         'calificacion_pct': calificacion_pct,
-        'indispensable_fallida': indispensable_fallida,
-        'precio_senal': precio_senal,
-        'target_profit_price': None,
-        'stop_loss_price': None,
+        'precio_senal': precio_actual,
+        'target_profit_price': target_profit_price,
+        'stop_loss_price': stop_loss_price,
         'reglas_cumplidas_codigos': ','.join(reglas_cumplidas) if reglas_cumplidas else None,
-        'reglas_indispensables_fallidas_codigos': ','.join(indispensables_fallidas) if indispensables_fallidas else None,
         'fecha_registro': datetime.datetime.now(),
         'version': 1,
         'apalancamiento_calculado': estrategia.get('lim_inf_apalancamiento', 1),
-        'mult_sl_asignado': estrategia.get('sl_atr_mult', 1.0),
-        'mult_tp_asignado': estrategia.get('tp_atr_mult', 1.0),
-        'atr_percent_usado': atr_percent_usado,
+        'mult_sl_asignado': mult_sl,
+        'mult_tp_asignado': mult_tp,
+        'atr_percent_usado': atr_percent,
         'yyyy': yyyy,
         'mm': mm,
         'dd': dd,
         'hh': hh,
         'min': min_,
-        'id_estado_senal': id_estado_senal,
-        'comentarios': None  # Se mantiene para compatibilidad SOLO en senales_generadas
+        'id_estado_senal': id_estado_senal
+        # 'comentarios': None  # Solo en senales_generadas, NO en no_viables
     }
     senal = convert_decimals_to_floats(senal)
     es_viable = (id_estado_senal == 1)
-    return senal, es_viable, motivo_no_viable, detalle_no_viable
+    return senal, es_viable, motivo_no_viable, detalle_no_viable, calificacion_pct
 
 def convert_decimals_to_floats(d):
     for k, v in d.items():
@@ -369,7 +407,12 @@ def convert_decimals_to_floats(d):
 
 def insertar_senal(conn, metadata, senal):
     senales_tbl = Table('senales_generadas', metadata, autoload_with=conn)
+    # Quitar campos que ya no existen en la tabla (por si acaso)
+    for campo in ['indispensable_fallida', 'reglas_indispensables_fallidas_codigos']:
+        if campo in senal:
+            del senal[campo]
     try:
+        # 'comentarios' es válido solo en senales_generadas
         insert_stmt = senales_tbl.insert().values(**senal)
         result = conn.execute(insert_stmt)
         if hasattr(result, "rowcount") and result.rowcount and result.rowcount > 0:
@@ -388,25 +431,27 @@ def insertar_senal(conn, metadata, senal):
         except Exception as rb_ex:
             logger.error(f"Error al hacer rollback tras fallo de insert VIABLE: {rb_ex}")
 
-def insertar_senal_no_viable(conn, metadata, senal, motivo_no_viable, detalle_no_viable):
+def insertar_senal_no_viable(conn, metadata, senal, motivo_no_viable, detalle_no_viable, calificacion_pct_nv):
     senales_no_viables_tbl = Table('senales_no_viables', metadata, autoload_with=conn)
     senal_nv = dict(senal)
+    # Quitar campos que no existen en la tabla no viables
+    for campo in ['indispensable_fallida', 'reglas_indispensables_fallidas_codigos', 'comentarios']:
+        if campo in senal_nv:
+            del senal_nv[campo]
     senal_nv['motivo_no_viable'] = motivo_no_viable
     senal_nv['detalle_evaluacion'] = detalle_no_viable if detalle_no_viable else None
-    # Elimina el campo 'comentarios' si existe, para evitar el error "Unconsumed column names: comentarios"
-    if 'comentarios' in senal_nv:
-        del senal_nv['comentarios']
+    senal_nv['calificacion_pct'] = calificacion_pct_nv
     senal_nv = convert_decimals_to_floats(senal_nv)
     try:
         insert_stmt = senales_no_viables_tbl.insert().values(**senal_nv)
         result = conn.execute(insert_stmt)
         if hasattr(result, "rowcount") and result.rowcount and result.rowcount > 0:
             logger.info(
-                f"Se insertó señal NO VIABLE en senales_no_viables para estrategia {senal['id_estrategia_fk']}, ticker {senal['ticker_fk']}, ts {senal['timestamp_senal']} (estado {senal['id_estado_senal']}) -- Motivo: {motivo_no_viable}"
+                f"Se insertó señal NO VIABLE en senales_no_viables para estrategia {senal_nv['id_estrategia_fk']}, ticker {senal_nv['ticker_fk']}, ts {senal_nv['timestamp_senal']} (estado {senal_nv['id_estado_senal']})"
             )
         else:
             logger.warning(
-                f"No se insertó señal NO VIABLE para estrategia {senal['id_estrategia_fk']}, ticker {senal['ticker_fk']}, ts {senal['timestamp_senal']}."
+                f"No se insertó señal NO VIABLE para estrategia {senal_nv['id_estrategia_fk']}, ticker {senal_nv['ticker_fk']}, ts {senal_nv['timestamp_senal']}."
             )
     except Exception as ex:
         logger.error(f"Error insertando señal no viable: {ex}")
@@ -424,5 +469,5 @@ if __name__ == '__main__':
 # Resumen: Motor batch para ejecutar estrategias de trading sobre datos históricos,
 #          evaluando reglas y generando señales en la tabla senales_generadas (viables)
 #          y senales_no_viables (descartadas/no operables).
-# Versión: 1.2.5   (2025-06-10)
+# Versión: 1.2.8   (2025-06-11)
 # ===========================================================
