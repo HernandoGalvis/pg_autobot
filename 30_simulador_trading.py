@@ -9,8 +9,10 @@
 #              MODIFICADO: Registra id_estrategia_fk en log_operaciones_simuladas.
 #              MODIFICADO: Calcula y registra duracion_operacion (minutos) y porc_sl/porc_tp (%) en operaciones_simuladas y log.
 #              CONFIRMADO: SOLO considera inversionistas activos y estrategias activas.
-# Versión: 1.3.7
-# Fecha: 2025-06-15
+#              MODIFICADO: Filtra señales LONG solo si porc_long >= 70 y SHORT solo si porc_short >= 70.
+#              AGREGADO: atr_percent_usado y volumen_osc_asociado desde indicadores (primary_timeframe) en operaciones_simuladas y log_operaciones_simuladas.
+# Versión: 1.3.8
+# Fecha: 2025-06-16
 # Autor: Hernando Galvis
 # ===============================================================================
 
@@ -23,11 +25,15 @@ import logging
 import traceback
 
 fecha_inicio = "2025-04-01 00:00:00"
-fecha_fin    = "2025-05-01 00:00:00"
+fecha_fin    = "2025-06-01 00:00:00"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 import numpy as np
+
+# UMBRAL de viabilidad de señales
+UMBRAL_LONG = 70.0
+UMBRAL_SHORT = 70.0
 
 def py_native(val):
     """Convierte valores numpy/pandas a tipos nativos de Python para SQL."""
@@ -77,7 +83,7 @@ def cargar_inversionista_ticker(engine, id_inversionista, ticker):
 def cargar_senales_activas(engine, tickers=None, fecha_inicio=None, fecha_fin=None):
     # Solo señales de estrategias activas (campo activa = TRUE)
     query = """
-    SELECT sg.* FROM senales_generadas sg
+    SELECT sg.*, e.primary_timeframe FROM senales_generadas sg
     JOIN estrategias e ON sg.id_estrategia_fk = e.id_estrategia
     WHERE sg.id_estado_senal IN (
         SELECT id_estado_senal FROM estados_senales WHERE permite_operar = TRUE
@@ -103,6 +109,24 @@ def cargar_ohlcv_1m(engine, ticker, fecha_inicio, fecha_fin):
     ORDER BY timestamp ASC
     """
     return pd.read_sql(query, engine, index_col="timestamp")
+
+def obtener_valor_indicador(engine, ticker, timestamp, timeframe, campo):
+    """
+    Obtiene el valor de un campo indicador para un ticker y timestamp dado en el timeframe solicitado.
+    """
+    query = f"""
+    SELECT {campo}
+    FROM indicadores
+    WHERE ticker = '{ticker}'
+      AND timeframe = {timeframe}
+      AND "timestamp" <= '{timestamp}'
+    ORDER BY "timestamp" DESC
+    LIMIT 1
+    """
+    df = pd.read_sql(query, engine)
+    if not df.empty:
+        return float(df.iloc[0][campo]) if df.iloc[0][campo] is not None else None
+    return None
 
 def calcular_sl_tp(precio_entrada, atr_pct, mult_sl, mult_tp, tipo):
     if tipo.upper() == "LONG":
@@ -149,7 +173,7 @@ def registrar_log_operacion(
     detalle, capital_antes, capital_despues, precio_senal, sl, tp, cantidad,
     timestamp_apertura=None, timestamp_cierre=None, motivo_no_operacion=None,
     resultado=None, motivo_cierre=None, precio_cierre=None,
-    duracion_operacion=None, porc_sl=None, porc_tp=None
+    duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
 ):
     yyyy_open, mm_open, dd_open = extract_ymd(timestamp_apertura)
     yyyy_close, mm_close, dd_close = extract_ymd(timestamp_cierre)
@@ -181,7 +205,8 @@ def registrar_log_operacion(
         "precio_cierre": py_native(precio_cierre),
         "duracion_operacion": py_native(duracion_operacion),
         "porc_sl": py_native(porc_sl),
-        "porc_tp": py_native(porc_tp)
+        "porc_tp": py_native(porc_tp),
+        "volumen_osc_asociado": py_native(volumen_osc_asociado)
     }
     params = py_native_dict(params)
     ins = text("""
@@ -190,17 +215,29 @@ def registrar_log_operacion(
         detalle, capital_antes, capital_despues, precio_senal, sl, tp, cantidad,
         yyyy_open, mm_open, dd_open, yyyy_close, mm_close, dd_close,
         motivo_no_operacion, resultado, motivo_cierre, precio_cierre,
-        duracion_operacion, porc_sl, porc_tp
+        duracion_operacion, porc_sl, porc_tp, volumen_osc_asociado
     ) VALUES (
         :timestamp_evento, :id_inversionista_fk, :id_estrategia_fk, :id_senal_fk, :id_operacion_fk, :ticker, :tipo_evento,
         :detalle, :capital_antes, :capital_despues, :precio_senal, :sl, :tp, :cantidad,
         :yyyy_open, :mm_open, :dd_open, :yyyy_close, :mm_close, :dd_close,
         :motivo_no_operacion, :resultado, :motivo_cierre, :precio_cierre,
-        :duracion_operacion, :porc_sl, :porc_tp
+        :duracion_operacion, :porc_sl, :porc_tp, :volumen_osc_asociado
     )
     """)
     session.execute(ins, params)
     session.commit()
+
+def puede_operar_senal(senal):
+    # Verifica si la señal cumple los requisitos de porc_long/porc_short según el tipo
+    tipo = str(senal.get("tipo_senal", "")).upper()
+    porc_long = float(senal.get("porc_long", 0) or 0)
+    porc_short = float(senal.get("porc_short", 0) or 0)
+    if tipo == "LONG":
+        return porc_long >= UMBRAL_LONG
+    elif tipo == "SHORT":
+        return porc_short >= UMBRAL_SHORT
+    else:
+        return False
 
 def simular():
     engine = get_engine()
@@ -213,6 +250,11 @@ def simular():
 
         senales = cargar_senales_activas(engine, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
         logging.info(f"Se cargaron {len(senales)} señales activas de estrategias activas entre {fecha_inicio} y {fecha_fin}.")
+
+        # ======= FILTRA señales por umbrales de porc_long y porc_short =======
+        mask = senales.apply(puede_operar_senal, axis=1)
+        senales = senales[mask].reset_index(drop=True)
+        logging.info(f"Señales después de filtrar por porc_long/porc_short: {len(senales)}")
 
         for inv in inversionistas:
             logging.info(f"Simulando para inversionista {inv['nombre']} (id={inv['id_inversionista']})")
@@ -252,7 +294,7 @@ def simular():
                             capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                             timestamp_apertura=senal["timestamp_senal"],
                             motivo_no_operacion="limite_diario_operaciones",
-                            duracion_operacion=None, porc_sl=None, porc_tp=None
+                            duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
                         )
                         continue
 
@@ -267,7 +309,7 @@ def simular():
                             capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                             timestamp_apertura=senal["timestamp_senal"],
                             motivo_no_operacion="limite_operaciones_abiertas",
-                            duracion_operacion=None, porc_sl=None, porc_tp=None
+                            duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
                         )
                         continue
 
@@ -280,7 +322,7 @@ def simular():
                             "Precio de señal inválido o nulo", capital_antes, capital_actual, precio,
                             None, None, None, timestamp_apertura=senal['timestamp_senal'],
                             motivo_no_operacion="precio_invalido",
-                            duracion_operacion=None, porc_sl=None, porc_tp=None
+                            duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
                         )
                         continue
 
@@ -302,7 +344,7 @@ def simular():
                             msg, capital_antes, capital_actual, precio, None, None, None,
                             timestamp_apertura=senal['timestamp_senal'],
                             motivo_no_operacion="capital_insuficiente",
-                            duracion_operacion=None, porc_sl=None, porc_tp=None
+                            duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
                         )
                         break
 
@@ -310,33 +352,38 @@ def simular():
 
                     origen_parametros = None
 
+                    # === ATR y VOLUMEN_OSC del primary_timeframe ===
+                    primary_timeframe = int(senal.get("primary_timeframe", 240))
+                    atr_percent = obtener_valor_indicador(engine, ticker, senal["timestamp_senal"], primary_timeframe, "atr_percent")
+                    volumen_osc = obtener_valor_indicador(engine, ticker, senal["timestamp_senal"], primary_timeframe, "volumen_osc")
+
                     if usar_param_senal:
                         sl_raw = senal.get("stop_loss_price")
                         tp_raw = senal.get("take_profit_price")
                         if sl_raw is None or tp_raw is None:
                             mult_sl = float(senal.get("mult_sl_asignado", 1.0))
                             mult_tp = float(senal.get("mult_tp_asignado", 2.0))
-                            atr_pct = float(senal.get("atr_percent_usado", 0.01))
+                            atr_pct = atr_percent if atr_percent is not None else float(senal.get("atr_percent_usado", 0.01))
                             sl, tp = calcular_sl_tp(precio, atr_pct, mult_sl, mult_tp, senal["tipo_senal"])
                         else:
                             sl = float(sl_raw)
                             tp = float(tp_raw)
+                            atr_pct = atr_percent if atr_percent is not None else float(senal.get("atr_percent_usado", 0.01))
                         apalancamiento = int(senal.get("apalancamiento_calculado") or 1)
                         mult_sl = float(senal.get("mult_sl_asignado", 1.0))
                         mult_tp = float(senal.get("mult_tp_asignado", 2.0))
-                        atr_pct = float(senal.get("atr_percent_usado", 0.01))
                         origen_parametros = "senal"
                     elif inv_ticker is not None:
                         mult_sl = float(inv_ticker.get("mult_sl", inv.get("mult_sl", 1.0)))
                         mult_tp = float(inv_ticker.get("mult_tp", inv.get("mult_tp", 2.0)))
-                        atr_pct = float(inv_ticker.get("atr_percent", senal.get("atr_percent_usado", 0.01)))
+                        atr_pct = atr_percent if atr_percent is not None else float(inv_ticker.get("atr_percent", senal.get("atr_percent_usado", 0.01)))
                         sl, tp = calcular_sl_tp(precio, atr_pct, mult_sl, mult_tp, senal["tipo_senal"])
                         apalancamiento = int(inv_ticker.get("apalancamiento", inv.get("apalancamiento_max", 1)))
                         origen_parametros = "inversionista_ticker"
                     else:
                         mult_sl = float(inv.get("mult_sl", 1.0))
                         mult_tp = float(inv.get("mult_tp", 2.0))
-                        atr_pct = float(senal.get("atr_percent_usado", 0.01))
+                        atr_pct = atr_percent if atr_percent is not None else float(senal.get("atr_percent_usado", 0.01))
                         sl, tp = calcular_sl_tp(precio, atr_pct, mult_sl, mult_tp, senal["tipo_senal"])
                         apalancamiento = int(inv.get("apalancamiento_max", 1))
                         origen_parametros = "inversionista"
@@ -352,7 +399,7 @@ def simular():
                         stop_loss_price, take_profit_price, atr_percent_usado, mult_sl_asignado, mult_tp_asignado,
                         origen_parametros,
                         yyyy_open, mm_open, dd_open,
-                        porc_sl, porc_tp
+                        porc_sl, porc_tp, volumen_osc_asociado
                     ) VALUES (
                         :id_inversionista, :id_estrategia, :id_senal, :ticker, :timestamp_apertura,
                         :precio_entrada, :cantidad, :apalancamiento, :tipo_operacion, :capital_riesgo_usado,
@@ -360,7 +407,7 @@ def simular():
                         :stop_loss_price, :take_profit_price, :atr_percent_usado, :mult_sl_asignado, :mult_tp_asignado,
                         :origen_parametros,
                         :yyyy_open, :mm_open, :dd_open,
-                        :porc_sl, :porc_tp
+                        :porc_sl, :porc_tp, :volumen_osc_asociado
                     ) RETURNING id_operacion
                     """)
                     # --- CONVIERTE TODOS LOS PARÁMETROS A TIPOS PYTHON NATIVOS ---
@@ -386,7 +433,8 @@ def simular():
                         "mm_open": mm_open,
                         "dd_open": dd_open,
                         "porc_sl": porc_sl,
-                        "porc_tp": porc_tp
+                        "porc_tp": porc_tp,
+                        "volumen_osc_asociado": volumen_osc
                     }
                     op_params = py_native_dict(op_params)
                     op_res = session.execute(ins_op, op_params)
@@ -397,7 +445,7 @@ def simular():
                         f"Operación abierta (SL:{sl}, TP:{tp}, origen:{origen_parametros}, monto_usd:{monto_usd}, cantidad:{cantidad}, porc_sl:{porc_sl}, porc_tp:{porc_tp})",
                         capital_antes, capital_actual, precio, sl, tp, cantidad,
                         timestamp_apertura=senal['timestamp_senal'],
-                        duracion_operacion=None, porc_sl=porc_sl, porc_tp=porc_tp
+                        duracion_operacion=None, porc_sl=porc_sl, porc_tp=porc_tp, volumen_osc_asociado=volumen_osc
                     )
                     # --- AGREGAR OPERACIÓN AL ARREGLO EN MEMORIA ---
                     operaciones_abiertas_mem.append({
@@ -493,7 +541,7 @@ def simular():
                         timestamp_apertura=senal['timestamp_senal'],
                         timestamp_cierre=cierre_timestamp,
                         motivo_cierre=motivo_cierre, resultado=resultado, precio_cierre=cierre_precio,
-                        duracion_operacion=duracion_operacion, porc_sl=porc_sl_cierre, porc_tp=porc_tp_cierre
+                        duracion_operacion=duracion_operacion, porc_sl=porc_sl_cierre, porc_tp=porc_tp_cierre, volumen_osc_asociado=volumen_osc
                     )
                     # --- REMOVER OPERACIÓN DEL ARREGLO EN MEMORIA AL CERRARLA ---
                     operaciones_abiertas_mem = [
@@ -510,7 +558,7 @@ def simular():
                         error_msg, capital_antes, capital_actual, senal.get("precio_senal"), None, None, None,
                         timestamp_apertura=senal.get('timestamp_senal'),
                         motivo_no_operacion="error",
-                        duracion_operacion=None, porc_sl=None, porc_tp=None
+                        duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
                     )
 
             logging.info(f"Capital final para {inv['nombre']}: {capital_actual}")
@@ -524,7 +572,7 @@ def simular():
             session, "error", None, None, None, None, None,
             error_msg, None, None, None, None, None, None,
             motivo_no_operacion="error_global",
-            duracion_operacion=None, porc_sl=None, porc_tp=None
+            duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
         )
 
     finally:
