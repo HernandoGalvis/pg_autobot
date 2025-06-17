@@ -16,6 +16,7 @@ import logging
 import operator
 import importlib.util
 from decimal import Decimal
+import decimal
 
 from sqlalchemy import create_engine, MetaData, Table, select, and_
 from sqlalchemy.orm import sessionmaker
@@ -137,8 +138,8 @@ def evaluar_regla(regla, data_valor, op_python_map):
         return False
 
 def main():
-    fecha_inicio = datetime.datetime(2025, 4, 1, 0, 0, 0)
-    fecha_fin    = datetime.datetime(2025, 5, 1, 0, 0, 0)
+    fecha_inicio = datetime.datetime(2025, 5, 1, 0, 0, 0)
+    fecha_fin    = datetime.datetime(2025, 6, 1, 0, 0, 0)
     timeframe_base = 5
     tickers_filtrar = None
 
@@ -173,7 +174,7 @@ def main():
                     fecha_actual_commit = None
                     for ts in timestamps:
                         try:
-                            resultado, es_viable, motivo_no_viable, detalle_no_viable, calificacion_pct_nv = procesar_estrategia_sobre_timestamp(
+                            resultado, es_viable, motivo_no_viable, detalle_no_viable, calificacion_pct = procesar_estrategia_sobre_timestamp(
                                 conn, metadata, estrategia, reglas_resumen, reglas_alertas, reglas_indicadores,
                                 ticker, ts, op_python_map, estados_senales
                             )
@@ -181,7 +182,7 @@ def main():
                                 if es_viable:
                                     insertar_senal(conn, metadata, resultado)
                                 else:
-                                    insertar_senal_no_viable(conn, metadata, resultado, motivo_no_viable, detalle_no_viable, calificacion_pct_nv)
+                                    insertar_senal_no_viable(conn, metadata, resultado, motivo_no_viable, detalle_no_viable, calificacion_pct)
                         except Exception as ex:
                             logger.error(f"Error procesando señal para {ticker} ts={ts}: {ex}")
 
@@ -228,6 +229,9 @@ def procesar_estrategia_sobre_timestamp(
     conn, metadata, estrategia, reglas_resumen, reglas_alertas, reglas_indicadores,
     ticker, ts, op_python_map, estados_senales
 ):
+    UMBRAL_PORC_LONG = 70.0
+    UMBRAL_PORC_SHORT = 50.0
+
     puntos_totales = 0.0
     puntos_obtenidos = 0.0
     reglas_cumplidas = []
@@ -333,6 +337,11 @@ def procesar_estrategia_sobre_timestamp(
     else:
         id_estado_senal = 1
 
+    # === NUEVO: Agrega porc_* de resumen_alertas ===
+    porc_long = resumen_dict.get('porc_long', 0) or 0
+    porc_short = resumen_dict.get('porc_short', 0) or 0
+    porc_neutral = resumen_dict.get('porc_neutral', 0) or 0
+
     # === NUEVO: Cálculo de SL, TP, apalancamiento, multiplicadores y ATR ===
     precio_actual = ind_dict.get('precio_actual')
     atr_percent = ind_dict.get('atr_percent')
@@ -392,11 +401,35 @@ def procesar_estrategia_sobre_timestamp(
         'dd': dd,
         'hh': hh,
         'min': min_,
-        'id_estado_senal': id_estado_senal
+        'id_estado_senal': id_estado_senal,
+        'porc_long': porc_long,
+        'porc_short': porc_short,
+        'porc_neutral': porc_neutral
         # 'comentarios': None  # Solo en senales_generadas, NO en no_viables
     }
     senal = convert_decimals_to_floats(senal)
     es_viable = (id_estado_senal == 1)
+
+    # === NUEVA validación de porc_long / porc_short antes de retornar ===
+    motivo_no_viable_porcentaje = ""
+    detalle_no_viable_porcentaje = {}
+    tipo_operacion_eval = (tipo_operacion or '').upper()
+    if tipo_operacion_eval == 'LONG' and porc_long < UMBRAL_PORC_LONG:
+        es_viable = False
+        id_estado_senal = 3
+        motivo_no_viable_porcentaje = f"porc_long insuficiente: {porc_long:.2f} < {UMBRAL_PORC_LONG}"
+        detalle_no_viable_porcentaje = {'porc_long': porc_long}
+    elif tipo_operacion_eval == 'SHORT' and porc_short < UMBRAL_PORC_SHORT:
+        es_viable = False
+        id_estado_senal = 3
+        motivo_no_viable_porcentaje = f"porc_short insuficiente: {porc_short:.2f} < {UMBRAL_PORC_SHORT}"
+        detalle_no_viable_porcentaje = {'porc_short': porc_short}
+
+    # Si es no viable por porcentaje, sobreescribe motivos
+    if motivo_no_viable_porcentaje:
+        motivo_no_viable = motivo_no_viable_porcentaje
+        detalle_no_viable = detalle_no_viable_porcentaje
+
     return senal, es_viable, motivo_no_viable, detalle_no_viable, calificacion_pct
 
 def convert_decimals_to_floats(d):
@@ -404,6 +437,16 @@ def convert_decimals_to_floats(d):
         if isinstance(v, Decimal):
             d[k] = float(v)
     return d
+
+def convert_decimals_in_obj(obj):
+    if isinstance(obj, dict):
+        return {k: convert_decimals_in_obj(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimals_in_obj(i) for i in obj]
+    elif isinstance(obj, decimal.Decimal):
+        return float(obj)
+    else:
+        return obj
 
 def insertar_senal(conn, metadata, senal):
     senales_tbl = Table('senales_generadas', metadata, autoload_with=conn)
@@ -441,6 +484,11 @@ def insertar_senal_no_viable(conn, metadata, senal, motivo_no_viable, detalle_no
     senal_nv['motivo_no_viable'] = motivo_no_viable
     senal_nv['detalle_evaluacion'] = detalle_no_viable if detalle_no_viable else None
     senal_nv['calificacion_pct'] = calificacion_pct_nv
+
+    # --- CORRECCION: convertir Decimals en el JSON ---
+    if 'detalle_evaluacion' in senal_nv and senal_nv['detalle_evaluacion'] is not None:
+        senal_nv['detalle_evaluacion'] = convert_decimals_in_obj(senal_nv['detalle_evaluacion'])
+
     senal_nv = convert_decimals_to_floats(senal_nv)
     try:
         insert_stmt = senales_no_viables_tbl.insert().values(**senal_nv)
