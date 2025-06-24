@@ -3,11 +3,20 @@
 # Descripción: Simulador de trading realista basado en velas de 1 minuto, múltiples inversionistas y tickers.
 #              Controla operaciones abiertas y límites en memoria, reflejando cada evento en la BD/log.
 #              Para cada ticker y cada inversionista, recorre el tiempo minuto a minuto (ohlcv_raw_1m).
-#              Procesa aperturas por señales y cierres por SL/TP.
+#              Procesa aperturas por señales y cierres por SL/TP y retroceso (trailing).
 #              Al finalizar la simulación, las operaciones abiertas se mantienen en la BD.
 #              Al iniciar una nueva simulación, carga las operaciones abiertas a memoria.
-# Versión: 2.1.0
-# Fecha: 2025-06-17
+#
+#              MODIFICACIONES (2025-06-23):
+#              - Se registra y actualiza el precio máximo alcanzado (LONG) y mínimo (SHORT) para cada operación abierta.
+#              - Al cerrar la operación, se registra el id de la vela de 1 minuto del cierre.
+#              - Se incluye control por retroceso (trailing) configurable: porc_limite_retro.
+#              - AJUSTE 2025-06-23: El cierre por retroceso (trailing) solo se activa si hubo un avance mínimo real respecto al precio de entrada.
+#              - AJUSTE 2025-06-24: El motivo_cierre = 'Retroceso' (sin detalles). Los datos de retroceso van al campo comentarios.
+#              - AJUSTE 2025-06-24: El cierre por retroceso ocurre si porc_retro >= porc_limite_retro (corrección lógica).
+#
+# Versión: 2.4.2
+# Fecha: 2025-06-24
 # Autor: Hernando Galvis
 # ===============================================================================
 
@@ -27,8 +36,12 @@ import numpy as np
 UMBRAL_LONG = 70.0
 UMBRAL_SHORT = 55.0
 
-FECHA_INICIO = "2024-01-01 00:00:00"
+FECHA_INICIO = "2025-03-01 00:00:00"
 FECHA_FIN    = "2025-06-20 00:00:00"
+
+# --- Parámetro de trailing/retroceso ---
+porc_limite_retro = 75.0  # % límite de retroceso permitido (configurable)
+avance_minimo_pct = 0.005  # 0.5% avance mínimo respecto al precio de entrada para activar trailing
 
 def py_native(val):
     import pandas as pd
@@ -92,7 +105,7 @@ def cargar_senales_activas(engine, ticker, fecha_inicio=None, fecha_fin=None):
 
 def cargar_ohlcv_1m(engine, ticker, fecha_inicio, fecha_fin):
     query = f"""
-    SELECT timestamp, open, high, low, close, volume
+    SELECT id, timestamp, open, high, low, close, volume
     FROM ohlcv_raw_1m
     WHERE ticker = '{ticker}'
       AND timestamp BETWEEN '{fecha_inicio}' AND '{fecha_fin}'
@@ -167,7 +180,8 @@ def registrar_log_operacion(
     detalle, capital_antes, capital_despues, precio_senal, sl, tp, cantidad,
     timestamp_apertura=None, timestamp_cierre=None, motivo_no_operacion=None,
     resultado=None, motivo_cierre=None, precio_cierre=None,
-    duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
+    duracion_operacion=None, porc_sl=None, porc_tp=None, volumen_osc_asociado=None,
+    id_vela_1m_cierre=None, precio_max_alcanzado=None, precio_min_alcanzado=None
 ):
     yyyy_open, mm_open, dd_open = extract_ymd(timestamp_apertura)
     yyyy_close, mm_close, dd_close = extract_ymd(timestamp_cierre)
@@ -203,7 +217,10 @@ def registrar_log_operacion(
         "duracion_operacion": py_native(duracion_operacion),
         "porc_sl": py_native(porc_sl),
         "porc_tp": py_native(porc_tp),
-        "volumen_osc_asociado": py_native(volumen_osc_asociado)
+        "volumen_osc_asociado": py_native(volumen_osc_asociado),
+        "id_vela_1m_cierre": id_vela_1m_cierre,
+        "precio_max_alcanzado": precio_max_alcanzado,
+        "precio_min_alcanzado": precio_min_alcanzado
     }
     params = py_native_dict(params)
     ins = text("""
@@ -213,14 +230,16 @@ def registrar_log_operacion(
         yyyy_open, mm_open, dd_open, yyyy_close, mm_close, dd_close,
         hh_open, hh_close,
         motivo_no_operacion, resultado, motivo_cierre, precio_cierre,
-        duracion_operacion, porc_sl, porc_tp, volumen_osc_asociado
+        duracion_operacion, porc_sl, porc_tp, volumen_osc_asociado,
+        id_vela_1m_cierre, precio_max_alcanzado, precio_min_alcanzado
     ) VALUES (
         :timestamp_evento, :id_inversionista_fk, :id_estrategia_fk, :id_senal_fk, :id_operacion_fk, :ticker, :tipo_evento,
         :detalle, :capital_antes, :capital_despues, :precio_senal, :sl, :tp, :cantidad,
         :yyyy_open, :mm_open, :dd_open, :yyyy_close, :mm_close, :dd_close,
         :hh_open, :hh_close,
         :motivo_no_operacion, :resultado, :motivo_cierre, :precio_cierre,
-        :duracion_operacion, :porc_sl, :porc_tp, :volumen_osc_asociado
+        :duracion_operacion, :porc_sl, :porc_tp, :volumen_osc_asociado,
+        :id_vela_1m_cierre, :precio_max_alcanzado, :precio_min_alcanzado
     )
     """)
     session.execute(ins, params)
@@ -229,7 +248,8 @@ def registrar_log_operacion(
 def cargar_operaciones_abiertas(engine, id_inversionista, ticker):
     query = f"""
     SELECT id_operacion, id_estrategia_fk, id_senal_fk, ticker_fk, timestamp_apertura, 
-           precio_entrada, cantidad, tipo_operacion, stop_loss_price, take_profit_price
+           precio_entrada, cantidad, tipo_operacion, stop_loss_price, take_profit_price,
+           precio_max_alcanzado, precio_min_alcanzado
     FROM operaciones_simuladas
     WHERE id_inversionista_fk = {id_inversionista}
       AND ticker_fk = '{ticker}'
@@ -249,7 +269,9 @@ def cargar_operaciones_abiertas(engine, id_inversionista, ticker):
             'cantidad': float(row['cantidad']),
             'id_estrategia': row['id_estrategia_fk'],
             'id_senal': row['id_senal_fk'],
-            'capital_antes': None,  # no lo sabemos, pero es opcional para los logs de cierre
+            'precio_max_alcanzado': float(row['precio_max_alcanzado']) if 'precio_max_alcanzado' in row and not pd.isna(row['precio_max_alcanzado']) else None,
+            'precio_min_alcanzado': float(row['precio_min_alcanzado']) if 'precio_min_alcanzado' in row and not pd.isna(row['precio_min_alcanzado']) else None,
+            'capital_antes': None,  # para logs de cierre
             'origen_parametros': None
         })
     return abiertas
@@ -269,7 +291,6 @@ def simular():
             if velas.empty:
                 continue
             senales = cargar_senales_activas(engine, ticker, FECHA_INICIO, FECHA_FIN)
-            # Indexar señales por timestamp
             senales_por_timestamp = defaultdict(list)
             for _, s in senales.iterrows():
                 ts = pd.Timestamp(s['timestamp_senal'])
@@ -278,9 +299,7 @@ def simular():
 
             for inv in inversionistas:
                 logging.info(f"Simulando {ticker} para inversionista {inv['nombre']} ({inv['id_inversionista']})")
-                # Cargar capital actual: si hay operaciones abiertas, no se sabe el capital real, pero se puede llevar como antes
                 capital_actual = float(inv["capital_aportado"])
-                # Cargar operaciones abiertas desde BD (NO se cierran al final de la simulación)
                 operaciones_abiertas_mem = cargar_operaciones_abiertas(engine, inv["id_inversionista"], ticker)
                 operaciones_diarias_count = defaultdict(int)
                 inv_ticker = cargar_inversionista_ticker(engine, inv["id_inversionista"], ticker)
@@ -351,7 +370,6 @@ def simular():
                                 )
                                 continue
 
-                            # MENSAJE DE NUEVA OPERACION
                             logging.info(
                                 f"[Nueva operación] {inv['nombre']} | Estrategia: {senal['id_estrategia_fk']} | Señal: {senal['id_senal']} | "
                                 f"Ticker: {ticker} | Fecha: {ts} | Tipo: {tipo} | Porc_long: {porc_long} | Porc_short: {porc_short} | "
@@ -430,6 +448,16 @@ def simular():
 
                             porc_sl, porc_tp = calcular_porc_sl_tp(precio, sl, tp)
 
+                            # --------- Inicializa máximos/mínimos ---------
+                            if tipo == "LONG":
+                                precio_max_alcanzado = float(velas.loc[ts, "high"])
+                                precio_min_alcanzado = None
+                            elif tipo == "SHORT":
+                                precio_max_alcanzado = None
+                                precio_min_alcanzado = float(velas.loc[ts, "low"])
+                            else:
+                                precio_max_alcanzado = precio_min_alcanzado = None
+
                             ins_op = text("""
                             INSERT INTO operaciones_simuladas (
                                 id_inversionista_fk, id_estrategia_fk, id_senal_fk, ticker_fk, timestamp_apertura,
@@ -438,7 +466,8 @@ def simular():
                                 stop_loss_price, take_profit_price, atr_percent_usado, mult_sl_asignado, mult_tp_asignado,
                                 origen_parametros,
                                 yyyy_open, mm_open, dd_open, hh_open,
-                                porc_sl, porc_tp, volumen_osc_asociado
+                                porc_sl, porc_tp, volumen_osc_asociado,
+                                precio_max_alcanzado, precio_min_alcanzado
                             ) VALUES (
                                 :id_inversionista, :id_estrategia, :id_senal, :ticker, :timestamp_apertura,
                                 :precio_entrada, :cantidad, :apalancamiento, :tipo_operacion, :capital_riesgo_usado,
@@ -446,7 +475,8 @@ def simular():
                                 :stop_loss_price, :take_profit_price, :atr_percent_usado, :mult_sl_asignado, :mult_tp_asignado,
                                 :origen_parametros,
                                 :yyyy_open, :mm_open, :dd_open, :hh_open,
-                                :porc_sl, :porc_tp, :volumen_osc_asociado
+                                :porc_sl, :porc_tp, :volumen_osc_asociado,
+                                :precio_max_alcanzado, :precio_min_alcanzado
                             ) RETURNING id_operacion
                             """)
                             op_params = {
@@ -473,7 +503,9 @@ def simular():
                                 "hh_open": extract_hh(ts),
                                 "porc_sl": porc_sl,
                                 "porc_tp": porc_tp,
-                                "volumen_osc_asociado": volumen_osc
+                                "volumen_osc_asociado": volumen_osc,
+                                "precio_max_alcanzado": precio_max_alcanzado,
+                                "precio_min_alcanzado": precio_min_alcanzado
                             }
                             op_params = py_native_dict(op_params)
                             op_res = session.execute(ins_op, op_params)
@@ -484,7 +516,8 @@ def simular():
                                 f"Operación abierta (SL:{sl}, TP:{tp}, origen:{origen_parametros}, monto_usd:{monto_usd}, cantidad:{cantidad}, porc_sl:{porc_sl}, porc_tp:{porc_tp})",
                                 capital_antes, capital_actual, precio, sl, tp, cantidad,
                                 timestamp_apertura=ts,
-                                duracion_operacion=None, porc_sl=porc_sl, porc_tp=porc_tp, volumen_osc_asociado=volumen_osc
+                                duracion_operacion=None, porc_sl=porc_sl, porc_tp=porc_tp, volumen_osc_asociado=volumen_osc,
+                                precio_max_alcanzado=precio_max_alcanzado, precio_min_alcanzado=precio_min_alcanzado
                             )
                             operaciones_abiertas_mem.append({
                                 'id_operacion': id_operacion,
@@ -497,17 +530,35 @@ def simular():
                                 'cantidad': cantidad,
                                 'id_estrategia': senal['id_estrategia_fk'],
                                 'id_senal': senal['id_senal'],
+                                'precio_max_alcanzado': precio_max_alcanzado,
+                                'precio_min_alcanzado': precio_min_alcanzado,
                                 'capital_antes': capital_antes,
                                 'origen_parametros': origen_parametros
                             })
                             operaciones_diarias_count[key_diaria] += 1
 
-                    # 2. Proceso de cierre por SL/TP
+                    # 2. Proceso de cierre por SL/TP, trailing/retroceso y actualización de max/min
                     nuevas_abiertas = []
                     for op in operaciones_abiertas_mem:
+                        # -- Actualiza el máximo/min alcanzado hasta el momento --
+                        if op['tipo'] == "LONG":
+                            if op['precio_max_alcanzado'] is None:
+                                op['precio_max_alcanzado'] = float(velas.loc[ts, "high"])
+                            else:
+                                op['precio_max_alcanzado'] = max(op['precio_max_alcanzado'], float(velas.loc[ts, "high"]))
+                        elif op['tipo'] == "SHORT":
+                            if op['precio_min_alcanzado'] is None:
+                                op['precio_min_alcanzado'] = float(velas.loc[ts, "low"])
+                            else:
+                                op['precio_min_alcanzado'] = min(op['precio_min_alcanzado'], float(velas.loc[ts, "low"]))
+
                         cerrar = False
                         motivo_cierre = None
                         precio_cierre = None
+                        id_vela_1m_cierre = None
+                        comentarios = None
+
+                        # --- Cierre tradicional SL/TP ---
                         if op['tipo'] == "LONG":
                             if velas.loc[ts, "low"] <= op['sl']:
                                 cerrar = True
@@ -526,7 +577,38 @@ def simular():
                                 cerrar = True
                                 motivo_cierre = "TP hit"
                                 precio_cierre = op['tp']
+
+                        # --- Trailing/retroceso con avance mínimo ---
+                        if not cerrar:
+                            precio_actual_1m = float(velas.loc[ts, "close"])
+                            if op['tipo'] == "LONG":
+                                x1 = (op['precio_max_alcanzado'] or 0) - op['precio_entrada']
+                                x2 = precio_actual_1m - op['precio_entrada']
+                                if x1 > op['precio_entrada'] * avance_minimo_pct and op['precio_max_alcanzado'] is not None and op['precio_max_alcanzado'] > op['precio_entrada'] and precio_actual_1m < op['precio_max_alcanzado']:
+                                    porc_retro = (op['precio_max_alcanzado'] - precio_actual_1m) / x1 * 100 if x1 != 0 else 0
+                                    if porc_retro >= porc_limite_retro:
+                                        cerrar = True
+                                        motivo_cierre = "Retroceso"
+                                        comentarios = f"porc_retro: {porc_retro:.2f}% >= {porc_limite_retro}%, avance: {x1:.4f}, desde max: {op['precio_max_alcanzado']}, entrada: {op['precio_entrada']}, actual: {precio_actual_1m}"
+                                        precio_cierre = precio_actual_1m
+                            elif op['tipo'] == "SHORT":
+                                x1 = op['precio_entrada'] - (op['precio_min_alcanzado'] or 0)
+                                x2 = op['precio_entrada'] - precio_actual_1m
+                                if x1 > op['precio_entrada'] * avance_minimo_pct and op['precio_min_alcanzado'] is not None and op['precio_min_alcanzado'] < op['precio_entrada'] and precio_actual_1m > op['precio_min_alcanzado']:
+                                    porc_retro = (precio_actual_1m - op['precio_min_alcanzado']) / x1 * 100 if x1 != 0 else 0
+                                    if porc_retro >= porc_limite_retro:
+                                        cerrar = True
+                                        motivo_cierre = "Retroceso"
+                                        comentarios = f"porc_retro: {porc_retro:.2f}% >= {porc_limite_retro}%, avance: {x1:.4f}, desde min: {op['precio_min_alcanzado']}, entrada: {op['precio_entrada']}, actual: {precio_actual_1m}"
+                                        precio_cierre = precio_actual_1m
+
                         if cerrar:
+                            # -- Agrega id de la vela de 1min del cierre --
+                            try:
+                                id_vela_1m_cierre = int(velas.loc[ts, "id"])
+                            except Exception:
+                                id_vela_1m_cierre = None
+
                             yyyy_close, mm_close, dd_close = extract_ymd(ts)
                             hh_close = extract_hh(ts)
                             duracion_operacion = calcular_duracion_operacion_minutos(op['ts_apertura'], ts)
@@ -536,6 +618,11 @@ def simular():
                                 else:
                                     resultado = (op['precio_entrada'] - precio_cierre) * op['cantidad']
                                 capital_actual += resultado
+                            # Pasa comentarios en campo detalle (solo para retroceso, sino None)
+                            detalle = (
+                                f"Cierre de operación {op['id_operacion']}: {motivo_cierre} en {ts}, precio {precio_cierre}, duración: {duracion_operacion} minutos"
+                                + (f" | {comentarios}" if comentarios and motivo_cierre == "Retroceso" else "")
+                            )
                             up_op = text("""
                                 UPDATE operaciones_simuladas
                                 SET timestamp_cierre = :timestamp_cierre,
@@ -547,7 +634,10 @@ def simular():
                                     mm_close = :mm_close,
                                     dd_close = :dd_close,
                                     hh_close = :hh_close,
-                                    duracion_operacion = :duracion_operacion
+                                    duracion_operacion = :duracion_operacion,
+                                    id_vela_1m_cierre = :id_vela_1m_cierre,
+                                    precio_max_alcanzado = :precio_max_alcanzado,
+                                    precio_min_alcanzado = :precio_min_alcanzado
                                 WHERE id_operacion = :id_operacion
                             """)
                             up_params = {
@@ -560,24 +650,28 @@ def simular():
                                 "hh_close": py_native(hh_close),
                                 "duracion_operacion": py_native(duracion_operacion),
                                 "id_operacion": op['id_operacion'],
+                                "id_vela_1m_cierre": id_vela_1m_cierre,
+                                "precio_max_alcanzado": op.get('precio_max_alcanzado'),
+                                "precio_min_alcanzado": op.get('precio_min_alcanzado')
                             }
                             up_params = py_native_dict(up_params)
                             session.execute(up_op, up_params)
                             session.commit()
                             registrar_log_operacion(
                                 session, "cierre", inv['id_inversionista'], op['id_estrategia'], op['id_senal'], op['id_operacion'], ticker,
-                                f"Cierre de operación {op['id_operacion']}: {motivo_cierre} en {ts}, precio {precio_cierre}, duración: {duracion_operacion} minutos",
+                                detalle,
                                 op['capital_antes'], capital_actual, op['precio_entrada'], op['sl'], op['tp'], op['cantidad'],
                                 timestamp_apertura=op['ts_apertura'],
                                 timestamp_cierre=ts,
                                 motivo_cierre=motivo_cierre, resultado=resultado, precio_cierre=precio_cierre,
-                                duracion_operacion=duracion_operacion, porc_sl=None, porc_tp=None, volumen_osc_asociado=None
+                                duracion_operacion=duracion_operacion, porc_sl=None, porc_tp=None, volumen_osc_asociado=None,
+                                id_vela_1m_cierre=id_vela_1m_cierre,
+                                precio_max_alcanzado=op.get('precio_max_alcanzado'), precio_min_alcanzado=op.get('precio_min_alcanzado')
                             )
                         else:
                             nuevas_abiertas.append(op)
                     operaciones_abiertas_mem = nuevas_abiertas
 
-                # Al final, NO cerrar operaciones abiertas por fin de simulación.
                 logging.info(f"Capital final para {inv['nombre']} ({ticker}): {capital_actual}")
 
     except Exception as e:
